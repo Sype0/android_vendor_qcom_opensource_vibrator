@@ -410,7 +410,11 @@ LedVibratorDevice::LedVibratorDevice() {
     mDetected = true;
 
     snprintf(devicename, sizeof(devicename), "%s/%s", LED_DEVICE, "device/driver");
-    mIsLdo = realpath(devicename, devicename) && strstr(devicename, "/qcom,qpnp-vibrator-ldo");
+    // Match the driver name exactly: vendor variants such as Xiaomi's
+    // qcom,qpnp-vibrator-ldo-tz play pulses shorter than 50 ms.
+    const char *driver;
+    mIsLdo = realpath(devicename, devicename) && (driver = strrchr(devicename, '/')) &&
+             !strcmp(driver, "/qcom,qpnp-vibrator-ldo");
 }
 
 int LedVibratorDevice::write_value(const char *file, const char *value) {
