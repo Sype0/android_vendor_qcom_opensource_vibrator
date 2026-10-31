@@ -35,6 +35,7 @@
 
 #include <aidl/android/hardware/vibrator/BnVibrator.h>
 #include <thread>
+#include <chrono>
 #include <mutex>
 
 namespace aidl {
@@ -93,10 +94,20 @@ public:
     LedVibratorDevice();
     int on(int32_t timeoutMs);
     int off();
+    int setAmplitude(float amplitude);
     bool mDetected;
     bool mIsLdo;
 private:
     int write_value(const char *file, const char *value);
+    int motorOn(int32_t timeoutMs);
+    int motorOff();
+    int updateMotorLocked();
+    std::mutex mLock;
+    float mAmplitude;
+    bool mMotorOn;
+    bool mAmplitudePending;
+    uint64_t mOnGeneration;
+    std::chrono::steady_clock::time_point mOnDeadline;
 };
 
 class VibratorOL : public BnVibrator {

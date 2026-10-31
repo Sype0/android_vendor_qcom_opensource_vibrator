@@ -401,6 +401,10 @@ LedVibratorDevice::LedVibratorDevice() {
 
     mDetected = false;
     mIsLdo = false;
+    mAmplitude = 1.0f;
+    mMotorOn = false;
+    mAmplitudePending = false;
+    mOnGeneration = 0;
 
     snprintf(devicename, sizeof(devicename), "%s/%s", LED_DEVICE, "activate");
     fd = TEMP_FAILURE_RETRY(open(devicename, O_RDWR));
@@ -448,7 +452,7 @@ int LedVibratorDevice::write_value(const char *file, const char *value) {
     return ret;
 }
 
-int LedVibratorDevice::on(int32_t timeoutMs) {
+int LedVibratorDevice::motorOn(int32_t timeoutMs) {
     char file[PATH_MAX];
     char value[32];
     int ret;
@@ -476,7 +480,7 @@ error:
     return ret;
 }
 
-int LedVibratorDevice::off()
+int LedVibratorDevice::motorOff()
 {
     char file[PATH_MAX];
     int ret;
@@ -484,6 +488,81 @@ int LedVibratorDevice::off()
     snprintf(file, sizeof(file), "%s/%s", LED_DEVICE, "activate");
     ret = write_value(file, "0");
     return ret;
+}
+
+/*
+ * The LED vibrator is an on/off motor: every non-zero waveform step runs it at
+ * full power. Haptics made for amplitude-capable actuators (SystemUI's MSDL
+ * fallbacks for notification swipes, 4-20% amplitude) then turn into long
+ * full-power buzzes. Report amplitude control and leave the motor off for
+ * steps below LED_MIN_AMPLITUDE.
+ */
+static constexpr float LED_MIN_AMPLITUDE = 0.25f;
+
+int LedVibratorDevice::on(int32_t timeoutMs) {
+    std::lock_guard<std::mutex> lock(mLock);
+
+    auto now = std::chrono::steady_clock::now();
+    int ret = (mMotorOn && now < mOnDeadline) ? motorOff() : 0;
+    mMotorOn = false;
+    mOnDeadline = now + std::chrono::milliseconds(timeoutMs);
+    uint64_t generation = ++mOnGeneration;
+
+    // The amplitude for this run arrives right after on(): start the motor
+    // from setAmplitude() so a low-amplitude run never kicks it at all. If no
+    // amplitude follows, play at the last amplitude.
+    mAmplitudePending = true;
+    std::thread([this, generation] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        std::lock_guard<std::mutex> lock(mLock);
+        if (generation != mOnGeneration || !mAmplitudePending)
+            return;
+        mAmplitudePending = false;
+        updateMotorLocked();
+    }).detach();
+
+    return ret;
+}
+
+int LedVibratorDevice::updateMotorLocked() {
+    auto now = std::chrono::steady_clock::now();
+    if (now >= mOnDeadline) {
+        // Not vibrating; the motor stopped on its own when the duration ran out.
+        mMotorOn = false;
+        return 0;
+    }
+
+    if (mAmplitude < LED_MIN_AMPLITUDE) {
+        int ret = mMotorOn ? motorOff() : 0;
+        mMotorOn = false;
+        return ret;
+    }
+
+    if (mMotorOn)
+        return 0;
+
+    auto remaining = std::chrono::ceil<std::chrono::milliseconds>(mOnDeadline - now);
+    int ret = motorOn(static_cast<int32_t>(remaining.count()));
+    mMotorOn = (ret == 0);
+    return ret;
+}
+
+int LedVibratorDevice::off() {
+    std::lock_guard<std::mutex> lock(mLock);
+
+    mOnDeadline = std::chrono::steady_clock::now();
+    mOnGeneration++;
+    mAmplitudePending = false;
+    mMotorOn = false;
+    return motorOff();
+}
+
+int LedVibratorDevice::setAmplitude(float amplitude) {
+    std::lock_guard<std::mutex> lock(mLock);
+
+    mAmplitude = amplitude;
+    mAmplitudePending = false;
+    return updateMotorLocked();
 }
 
 static bool is_VI_sense_supported() {
@@ -572,6 +651,7 @@ ndk::ScopedAStatus VibratorOL::getCapabilities(int32_t* _aidl_return) {
     *_aidl_return = IVibrator::CAP_ON_CALLBACK;
 
     if (ledVib.mDetected) {
+        *_aidl_return |= IVibrator::CAP_AMPLITUDE_CONTROL;
         ALOGD("QTI Vibrator reporting capabilities: %d", *_aidl_return);
         return ndk::ScopedAStatus::ok();
     }
@@ -728,8 +808,17 @@ ndk::ScopedAStatus VibratorOL::setAmplitude(float amplitude) {
     uint8_t tmp;
     int ret;
 
-    if (ledVib.mDetected)
-        return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+    if (ledVib.mDetected) {
+        ALOGD("Vibrator set amplitude: %f", amplitude);
+        if (amplitude == 0.0f)
+            return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_ILLEGAL_ARGUMENT));
+        // Never let an unexpected value (e.g. an unresolved DEFAULT_AMPLITUDE) mute the motor.
+        if (amplitude < 0.0f || amplitude > 1.0f)
+            amplitude = 1.0f;
+        if (ledVib.setAmplitude(amplitude) != 0)
+            return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
+        return ndk::ScopedAStatus::ok();
+    }
 
     if (!ff.mSupportGain)
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
